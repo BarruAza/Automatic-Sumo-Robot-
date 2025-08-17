@@ -1,0 +1,276 @@
+// Pin motor driver
+// Sesuaikan pin ini dengan skema koneksi Anda ke ESP32.
+// Tambahkan pin EN/ENA/ENB untuk PWM
+
+// Pin-pin untuk Motor KIRI (diasumsikan terhubung ke ENA L298N)
+const int IN1 = 26;    // Motor kiri - Kontrol arah
+const int IN2 = 25;    // Motor kiri - Kontrol arah
+const int ENA = 33;    // Pin Enable A (PWM) untuk motor kiri
+
+// Pin-pin untuk Motor KANAN (diasumsikan terhubung ke ENB L298N)
+const int IN3 = 18;    // Motor kanan - Kontrol arah
+const int IN4 = 21;    // Motor kanan - Kontrol arah
+const int ENB = 19;    // Pin Enable B (PWM) untuk motor kanan
+
+// Pin sensor HC-SR04
+const int trigPin = 14;    // Pin Trig (GPIO 14)
+const int echoPin = 13;    // Pin Echo (GPIO 13)
+
+// Pin Sensor IR
+const int IR_FRONT = 4;        // Sensor IR Depan (GPIO 4) - Sekarang sebagai sensor garis
+const int IR_sensor_back = 35; // Sensor IR Belakang (GPIO 35 adalah input-only, cocok untuk analogRead)
+
+// Variabel global untuk jarak
+long duration;
+float distance;
+
+// --- Definisi Nilai IR Berdasarkan Kalibrasi Anda ---
+// Nilai threshold untuk deteksi "hitam" oleh sensor IR (depan dan belakang).
+// Asumsi: nilai ADC TINGGI berarti hitam.
+// KALIBRASI INI PENTING! Sesuaikan nilai ini berdasarkan pengujian sensor Anda.
+// Contoh: Jika sensor Anda membaca 3000-4095 di atas hitam, set ke 3000.
+const int IR_THRESHOLD_BLACK_DETECT = 3000; // Contoh nilai, HARUS dikalibrasi!
+
+
+// --- Definisi State FSM (Finite State Machine) Robot ---
+enum RobotState {
+  STATE_IDLE,          // Robot diam, menunggu start
+  STATE_FORWARD,       // Robot bergerak maju (perilaku default)
+  STATE_AVOID_EDGE_BACK,    // Robot mendeteksi garis hitam di belakang, maju kuat untuk bertahan
+  STATE_AVOID_EDGE_FRONT,   // Robot mendeteksi garis hitam di depan, berhenti & mundur
+  STATE_ATTACK         // Robot mendeteksi lawan (via HC-SR04), maju menyerang
+};
+
+// Variabel untuk menyimpan state robot saat ini
+RobotState currentState = STATE_IDLE; // Robot akan mulai dalam keadaan diam
+
+// --- Konfigurasi PWM (Pulse Width Modulation) ---
+#define LEDC_TIMER_BIT    8         // Resolusi PWM: 8 bit (memberikan nilai 0-255)
+#define LEDC_BASE_FREQ    5000      // Frekuensi PWM dalam Hertz (Hz)
+
+// Kecepatan motor yang digunakan di berbagai mode pergerakan
+const int DEFAULT_MOTOR_SPEED = 180; // Kecepatan normal (Anda set 180)
+const int DEFEND_MOTOR_SPEED = 255;  // Kecepatan maksimal untuk bertahan di batas (saat IR belakang deteksi)
+
+
+// --- Fungsi Setup: Dijalankan sekali saat ESP32 pertama kali dinyalakan ---
+void setup() {
+  Serial.begin(115200); // Inisialisasi komunikasi serial untuk debugging
+  Serial.println("--- Sumobot ESP32 Siap Tempur! ---");
+
+  // Mengatur pin motor driver sebagai output
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+
+  // Mengatur pin sensor HC-SR04
+  pinMode(trigPin, OUTPUT);
+  pinMode(echoPin, INPUT);
+
+  // Mengatur pin sensor IR sebagai input
+  pinMode(IR_FRONT, INPUT);
+  pinMode(IR_sensor_back, INPUT);
+
+  // --- Konfigurasi LEDC untuk PWM ---
+  // ledcAttach(pin, frekuensi, resolusi) akan secara otomatis memilih channel PWM yang tersedia.
+  // Pastikan ENA untuk Motor KIRI dan ENB untuk Motor KANAN
+  ledcAttach(ENA, LEDC_BASE_FREQ, LEDC_TIMER_BIT); // PWM untuk motor kiri
+  ledcAttach(ENB, LEDC_BASE_FREQ, LEDC_TIMER_BIT); // PWM untuk motor kanan
+
+  Serial.println("Konfigurasi Sensor dan Motor Selesai.");
+  Serial.print("IR Black Detect Threshold (Garis): "); Serial.println(IR_THRESHOLD_BLACK_DETECT);
+  Serial.print("Kecepatan Motor Normal: "); Serial.println(DEFAULT_MOTOR_SPEED);
+  Serial.print("Kecepatan Motor Bertahan: "); Serial.println(DEFEND_MOTOR_SPEED);
+
+
+  // Tunggu sebentar sebelum robot mulai bergerak. Ini bisa diganti dengan tombol fisik.
+  Serial.println("Robot akan mulai bergerak dalam 2 detik...");
+  delay(2000);
+  currentState = STATE_FORWARD; // Setelah delay, robot langsung mulai maju
+  Serial.println("Robot memulai dalam keadaan: FORWARD");
+}
+
+// --- Fungsi Loop Utama: Dijalankan terus menerus ---
+void loop() {
+  // Baca semua sensor di awal setiap loop untuk mendapatkan kondisi terbaru
+  int IR_back = analogRead(IR_sensor_back);   // Pembacaan dari sensor IR belakang
+  int IR_front = analogRead(IR_FRONT);        // Pembacaan dari sensor IR depan
+  distance = getDistance();                   // Pembacaan jarak dari sensor ultrasonik
+
+  // --- Logika Transisi State (Prioritas Tinggi ke Rendah) ---
+
+  // 1. Prioritas Tertinggi: Deteksi garis hitam oleh sensor IR BELAKANG
+  if (IR_back >= IR_THRESHOLD_BLACK_DETECT) {
+    if (currentState != STATE_AVOID_EDGE_BACK) {
+      currentState = STATE_AVOID_EDGE_BACK;
+      Serial.println("Transisi ke keadaan: AVOID_EDGE_BACK (Garis Hitam Belakang Terdeteksi)");
+    }
+  }
+  // 2. Prioritas Tinggi Kedua: Deteksi garis hitam oleh sensor IR DEPAN
+  else if (IR_front >= IR_THRESHOLD_BLACK_DETECT) {
+    if (currentState != STATE_AVOID_EDGE_FRONT) {
+      currentState = STATE_AVOID_EDGE_FRONT;
+      Serial.println("Transisi ke keadaan: AVOID_EDGE_FRONT (Garis Hitam Depan Terdeteksi)");
+    }
+  }
+  // 3. Prioritas Menengah: Deteksi lawan oleh sensor Ultrasonik (HC-SR04)
+  else if (distance > 0 && distance < 20) { // Jarak 0 berarti timeout/tidak terdeteksi
+    if (currentState != STATE_ATTACK) {
+      currentState = STATE_ATTACK;
+      Serial.println("Transisi ke keadaan: ATTACK (Lawan Terdeteksi oleh Ultrasonik)");
+    }
+  }
+  // 4. Default: Jika tidak ada kondisi di atas, robot selalu maju
+  else {
+    if (currentState != STATE_FORWARD) { // Hanya beralih jika belum dalam state FORWARD
+      currentState = STATE_FORWARD;
+      Serial.println("Transisi ke keadaan: FORWARD (Area Aman, Maju)");
+    }
+  }
+
+  // --- Aksi Berdasarkan State Saat Ini ---
+  switch (currentState) {
+    case STATE_IDLE:
+      motorStop(); // Robot berhenti total
+      break;
+
+    case STATE_FORWARD:
+      // Bergerak maju sebagai perilaku default
+      Serial.println("Aksi: MAJU TERUS! (Kecepatan Normal)");
+      FORWARD(DEFAULT_MOTOR_SPEED);
+      break;
+
+    case STATE_AVOID_EDGE_BACK:
+      // Deteksi garis hitam di belakang, maju kencang untuk mempertahankan posisi
+      Serial.println("Aksi: AVOID_EDGE_BACK (Maju Kencang Mempertahankan Batas)");
+      FORWARD(DEFEND_MOTOR_SPEED); // Maju dengan kecepatan maksimal
+      break;
+
+    case STATE_AVOID_EDGE_FRONT:
+      // Deteksi garis hitam di depan, berhenti sejenak dan mundur
+      Serial.println("Aksi: AVOID_EDGE_FRONT (Berhenti & Mundur dari Garis Depan)");
+      motorStop();   // Berhenti sejenak
+      delay(100);    // Jeda singkat
+      BACKWARD(DEFAULT_MOTOR_SPEED); // Mundur dengan kecepatan normal
+      delay(300);    // Durasi mundur
+      motorStop();   // Berhenti setelah mundur
+      delay(50);
+      ROTATE_RIGHT(DEFAULT_MOTOR_SPEED); // Bisa berputar sedikit setelah mundur
+      delay(200);
+      motorStop();
+      delay(50);
+      // Setelah menghindari, transisi state akan dievaluasi lagi di awal loop berikutnya
+      break;
+
+    case STATE_ATTACK:
+      // Mendeteksi lawan (via HC-SR04), maju menyerang dengan kecepatan normal
+      Serial.println("Aksi: MAJU MENYERANG! (Kecepatan Normal)");
+      FORWARD(DEFAULT_MOTOR_SPEED);
+      break;
+  }
+
+  // --- Debugging Serial Print ---
+  Serial.print("IR Depan: "); Serial.print(IR_front);
+  Serial.print(" | IR Belakang: "); Serial.print(IR_back);
+  Serial.print(" | Jarak Ultrasonik: "); Serial.print(distance); Serial.println(" cm");
+  Serial.print("State Saat Ini: ");
+  switch (currentState) {
+    case STATE_IDLE: Serial.println("IDLE"); break;
+    case STATE_FORWARD: Serial.println("FORWARD"); break;
+    case STATE_AVOID_EDGE_BACK: Serial.println("AVOID_EDGE_BACK"); break;
+    case STATE_AVOID_EDGE_FRONT: Serial.println("AVOID_EDGE_FRONT"); break;
+    case STATE_ATTACK: Serial.println("ATTACK"); break;
+  }
+  Serial.println("---");
+
+  delay(50); // Jeda singkat setiap siklus loop untuk stabilitas
+}
+
+// --- Fungsi Sensor ---
+// Mengukur jarak menggunakan sensor HC-SR04
+float getDistance() {
+  digitalWrite(trigPin, LOW);      // Pastikan Trig Pin LOW
+  delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH);     // Kirim pulsa HIGH selama 10 mikrodetik
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+  duration = pulseIn(echoPin, HIGH, 30000); // Baca durasi pulsa baliknya (timeout 30ms)
+  if (duration == 0) {
+    return -1; // Mengembalikan -1 jika tidak ada pantulan (objek terlalu jauh atau tidak ada)
+  } else {
+    // Hitung jarak: (durasi * kecepatan suara) / 2
+    // Kecepatan suara di udara sekitar 0.0343 cm/mikrodetik
+    float jarak = (duration * 0.0343) / 2;
+    return jarak;
+  }
+}
+
+// --- Fungsi Kontrol Motor (dengan PWM) ---
+// Parameter 'speed' harus antara 0 (berhenti) dan 255 (maksimal)
+// CATATAN PENTING:
+// IN1/IN2/ENA -> Motor KIRI
+// IN3/IN4/ENB -> Motor KANAN
+// Logika HIGH/LOW untuk INx pin di bawah ini SUDAH DISESUAIKAN.
+// Jika setelah diunggah salah satu motor masih terbalik,
+// Anda hanya perlu membalik HIGH dan LOW pada pasangan pin INx di fungsi terkait.
+
+void motorForward(int speed) {
+  // Motor Kiri Maju (IN1/IN2)
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+  // Motor Kanan Maju (IN3/IN4)
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+  ledcWrite(ENA, speed); // Kecepatan motor kiri
+  ledcWrite(ENB, speed); // Kecepatan motor kanan
+}
+
+void motorBackward(int speed) {
+  // Motor Kiri Mundur (IN1/IN2)
+  digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH);
+  // Motor Kanan Mundur (IN3/IN4)
+  digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH);
+  ledcWrite(ENA, speed); // Kecepatan motor kiri
+  ledcWrite(ENB, speed); // Kecepatan motor kanan
+}
+
+void motorLeft(int speed) { // Robot berputar di tempat ke KIRI
+  // Motor Kiri Mundur (IN1/IN2)
+  digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH);
+  // Motor Kanan Maju (IN3/IN4)
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+  ledcWrite(ENA, speed); // Kecepatan motor kiri
+  ledcWrite(ENB, speed); // Kecepatan motor kanan
+}
+
+void motorRight(int speed) { // Robot berputar di tempat ke KANAN
+  // Motor Kiri Maju (IN1/IN2)
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+  // Motor Kanan Mundur (IN3/IN4)
+  digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH);
+  ledcWrite(ENA, speed); // Kecepatan motor kiri
+  ledcWrite(ENB, speed); // Kecepatan motor kanan
+}
+
+void motorStop() {
+  digitalWrite(IN1, LOW); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, LOW);
+  ledcWrite(ENA, 0); // Hentikan PWM motor kiri
+  ledcWrite(ENB, 0); // Hentikan PWM motor kanan
+}
+
+// --- Fungsi Pergerakan Robot (Memanggil Fungsi Kontrol Motor) ---
+void ROTATE_RIGHT(int speed) {
+  motorRight(speed);
+}
+
+void ROTATE_LEFT(int speed) {
+  motorLeft(speed);
+}
+
+void FORWARD(int speed) {
+  motorForward(speed);
+}
+
+void BACKWARD(int speed) {
+  motorBackward(speed);
+}
